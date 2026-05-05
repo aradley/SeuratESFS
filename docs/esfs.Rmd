@@ -1,0 +1,353 @@
+---
+title: "ESFS Workflow with Seurat"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+  github_document:
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy    = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  eval    = FALSE
+)
+```
+
+> **ESFS — Entropy Sorting Feature Selection**
+> Radley A. *et al.* (2026)
+> Preprint: <https://www.biorxiv.org/content/10.64898/2026.01.26.701684v1>
+> Source: <https://github.com/aradley/ESFS>
+
+---
+
+## Overview
+
+ESFS (Entropy Sorting Feature Selection) identifies marker genes and performs
+feature selection in single-cell RNA-seq data using information-theoretic
+metrics.  Unlike PCA-based workflows it operates directly in gene expression
+space, preserving biological interpretability and avoiding assumptions about
+cell-type structure.
+
+This vignette demonstrates the complete ESFS workflow using **SeuratESFS**,
+an R wrapper that calls the ESFS Python package under the hood via
+[reticulate](https://rstudio.github.io/reticulate/).
+
+## Installation
+
+### Step 1 — Install SeuratESFS
+
+```{r install-r-pkg}
+remotes::install_github("aradley/SeuratESFS")
+```
+
+### Step 2 — Set up the Python environment (once per machine)
+
+```{r install-python-env}
+library(SeuratESFS)
+
+# Auto-detects hardware:
+#   Apple Silicon → MLX/Metal backend
+#   NVIDIA GPU    → CUDA/CuPy backend
+#   Otherwise     → CPU/Numba backend
+install_esfs()
+```
+
+After installation you will be prompted to add one line to `~/.Rprofile`:
+
+```r
+options(esfs.conda_env = "r-esfs")
+```
+
+This ensures the correct Python environment is loaded automatically in every
+future R session.
+
+### Step 3 — Verify the installation
+
+```{r verify}
+check_esfs()
+```
+
+---
+
+## Loading packages
+
+**Important:** load `SeuratESFS` *before* Seurat (or any other package that
+may initialise Python) so the `.onLoad` hook can configure reticulate before
+Python starts.
+
+```{r load-pkgs}
+library(SeuratESFS)
+library(Seurat)
+```
+
+---
+
+## Example data
+
+We use the `pbmc3k` dataset from
+[SeuratData](https://github.com/satijalab/seurat-data), which contains 2,700
+peripheral blood mononuclear cells.
+
+```{r load-data}
+# install.packages("remotes")
+# remotes::install_github("satijalab/seurat-data")
+library(SeuratData)
+InstallData("pbmc3k")
+data("pbmc3k")
+
+# Standard Seurat pre-processing
+pbmc3k <- NormalizeData(pbmc3k)
+pbmc3k <- FindVariableFeatures(pbmc3k, nfeatures = 3000)
+pbmc3k <- ScaleData(pbmc3k)
+pbmc3k <- RunPCA(pbmc3k)
+pbmc3k <- FindNeighbors(pbmc3k, dims = 1:10)
+pbmc3k <- FindClusters(pbmc3k, resolution = 0.5)
+pbmc3k <- RunUMAP(pbmc3k, dims = 1:10)
+```
+
+---
+
+## ESFS workflow
+
+### Step 1 — Check the active backend
+
+```{r backend-info}
+GetESFSBackendInfo()
+# Example output on Apple Silicon:
+# "Backend: MLX/Metal (Apple Silicon GPU), Precision: float32"
+```
+
+### Step 2 — Scale the expression matrix
+
+`CreateESFSScaledMatrix()` scales each gene to \[0, 1\] using per-gene
+percentile clipping and removes genes with very low total expression.
+
+```{r scale-matrix}
+pbmc3k <- CreateESFSScaledMatrix(
+  pbmc3k,
+  clip_percentile = 97.5,
+  min_total_expr  = 50L
+)
+```
+
+### Step 3 — Calculate pairwise ES matrices (ES-GSS)
+
+This is the computationally intensive step. It calculates four pairwise
+information-theoretic metrics (ESS, EP, SW, SG) between all gene pairs.
+
+GPU acceleration is used automatically when available. On Apple Silicon the
+Metal GPU is used; on NVIDIA hardware CUDA/CuPy is used; otherwise Numba
+JIT-compiled CPU code runs in parallel.
+
+*Note: the first call incurs a one-time Numba compilation delay (~10–30 s)
+that is cached for subsequent sessions.*
+
+```{r calc-es-matrices}
+pbmc3k <- CalcESMatrices(
+  pbmc3k,
+  label         = "Self",   # compare each gene to every other gene
+  save_matrices = c("ESSs", "EPs"),
+  n_cores       = -1L       # use all available CPU cores
+)
+```
+
+### Step 4 — Rank genes by network connectivity
+
+Builds a weighted gene network from the ES matrices and ranks genes by
+normalised connectivity.
+
+```{r rank-genes}
+pbmc3k <- ESRankGenes(
+  pbmc3k,
+  label         = "Self",
+  ep_threshold  = 0.0,
+  ess_threshold = 0.01,
+  min_edges     = 5L
+)
+```
+
+### Step 5 — Visualise the top-ranked genes in a UMAP
+
+Embeds the top-ranked genes in a 2-D UMAP based on their pairwise ESS
+correlation matrix.  Clustering the gene UMAP reveals groups of co-expressed
+genes.
+
+```{r gene-umap}
+gene_umap <- PlotESFSGeneUMAP(
+  pbmc3k,
+  top_ranked_genes = 3000,
+  clustering       = "hdbscan",   # or an integer for KMeans
+  umap_min_dist    = 0.1,
+  umap_neighbours  = 20L
+)
+
+# gene_umap$genes     — names of the plotted genes
+# gene_umap$labels    — cluster label for each gene
+# gene_umap$embedding — UMAP coordinates (n_genes × 2)
+```
+
+### Step 6 — Compute cell UMAPs for each gene cluster
+
+For each cluster of genes identified above, project all cells into a 2-D UMAP
+using that cluster's gene set as features.
+
+```{r cell-umaps}
+cell_umap_result <- GetESFSCellUMAPs(
+  pbmc3k,
+  gene_clust_labels = gene_umap$labels,
+  top_ess_genes     = gene_umap$genes,
+  n_neighbors       = 30L,
+  min_dist          = 0.1,
+  log_transformed   = TRUE,
+  return_model      = FALSE
+)
+
+embeddings    <- cell_umap_result[[1]]   # list of embeddings, one per cluster
+selected_genes <- cell_umap_result[[2]] # list of gene sets, one per cluster
+```
+
+### Step 7 — Plot cell UMAPs coloured by cell type
+
+```{r plot-cell-umaps-label}
+# Colour by Seurat cluster identity
+pbmc3k$seurat_clusters_char <- as.character(pbmc3k$seurat_clusters)
+
+PlotESFSCellUMAPs(
+  pbmc3k,
+  gene_cluster_embeddings    = embeddings,
+  gene_cluster_selected_genes = selected_genes,
+  cell_label = "seurat_clusters_char",
+  ncol       = 2L
+)
+```
+
+```{r plot-cell-umaps-gene}
+# Colour by a specific gene's expression
+PlotESFSCellUMAPs(
+  pbmc3k,
+  gene_cluster_embeddings    = embeddings,
+  gene_cluster_selected_genes = selected_genes,
+  cell_label           = "CD3D",
+  log2_gene_expression = TRUE,
+  ncol                 = 2L
+)
+```
+
+---
+
+## Optional: Select N non-redundant marker genes (ES-FMG)
+
+ES-FMG uses simulated annealing to find a compact set of genes that captures
+maximally distinct expression patterns.
+
+```{r es-fmg}
+fmg_result <- RunESFMG(
+  pbmc3k,
+  N           = 100L,
+  label       = "Self",
+  num_reheats = 3L,
+  resolution  = 1.0    # 1 = maximally distinct; <0.5 for trajectories
+)
+
+# fmg_result$genes   — character vector of selected marker genes
+# fmg_result$scores  — numeric ES-FMG score for each gene
+# fmg_result$object  — updated Seurat object
+pbmc3k <- fmg_result$object
+head(fmg_result$genes)
+```
+
+---
+
+## Optional: KNN expression smoothing
+
+Smooth gene expression by averaging each cell over its k nearest neighbours
+in the correlation distance space defined by the top ESFS genes.
+
+```{r knn-smooth}
+pbmc3k <- KNNSmoothESFS(
+  pbmc3k,
+  use_genes    = gene_umap$genes,   # top-ranked genes define the distance metric
+  knn          = 30L,
+  log_scale    = FALSE,
+  max_size_gb  = 2.0   # extract smoothed matrix to R only if < 2 GB
+)
+
+# For small datasets the smoothed expression is available as a Seurat layer:
+# FeaturePlot(pbmc3k, features = "CD3D", layer = "esfs.smoothed")
+```
+
+---
+
+## Optional: Save and reload UMAP models
+
+UMAP models can be saved to disk and reloaded to project new cells into
+existing embeddings.
+
+```{r save-model}
+# Re-run with return_model = TRUE to get saveable models
+cell_umap_models <- GetESFSCellUMAPs(
+  pbmc3k,
+  gene_clust_labels = gene_umap$labels,
+  top_ess_genes     = gene_umap$genes,
+  return_model      = TRUE
+)
+
+model_list  <- cell_umap_models[[1]]
+gene_sets   <- cell_umap_models[[2]]
+
+# Save the model for cluster 0
+SaveESFSUMAPModel(
+  model     = model_list[[1]],
+  gene_list = gene_sets[[1]],
+  filepath  = "cluster0_umap.joblib"
+)
+
+# Reload later
+bundle <- LoadESFSUMAPModel("cluster0_umap.joblib")
+# bundle$model       — fitted umap-learn UMAP model (supports .transform())
+# bundle$gene_list   — genes used for the embedding
+# bundle$log_transformed — whether log2(X+1) was applied
+```
+
+---
+
+## Backend control
+
+```{r backend-control}
+# Check current backend
+GetESFSBackendInfo()
+
+# Force a specific backend (takes effect for all subsequent ESFS calls)
+UseESFSMLX()    # Apple Silicon Metal
+UseESFSGPU()    # NVIDIA CUDA
+UseESFSCPU()    # CPU / Numba
+
+# Or configure with full control
+ConfigureESFSBackend(gpu = TRUE, upcast = FALSE, verbose = TRUE)
+```
+
+**Backend capabilities:**
+
+| Operation | CUDA (NVIDIA) | MLX (Apple Silicon) | CPU |
+|-----------|:---:|:---:|:---:|
+| ES matrix calculations | GPU | GPU | Numba JIT |
+| ES-CCF / ES-FMG | CPU | CPU | CPU |
+| Cell UMAP KNN | cuML GPU | CPU | CPU |
+| Cell UMAP layout | cuML GPU | CPU | CPU |
+| Gene UMAP | CPU | CPU | CPU |
+| KNN smoothing (KNN step) | cuML GPU | CPU | CPU |
+
+---
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

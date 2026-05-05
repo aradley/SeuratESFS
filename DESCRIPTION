@@ -1,0 +1,33 @@
+Package: SeuratESFS
+Title: Seurat Wrapper for ESFS (Entropy Sorting Feature Selection)
+Version: 0.1.0
+Authors@R: person("Arthur", "Radley", email = "arthur.radley.1993@gmail.com",
+  role = c("aut", "cre"))
+Description: Provides Seurat-compatible wrapper functions for the ESFS Python
+    package (Entropy Sorting Feature Selection). ESFS identifies marker genes
+    and performs feature selection in single-cell RNA sequencing data using
+    information-theoretic metrics, without requiring prior cell type labels or
+    dimensionality reduction. This wrapper allows R/Seurat users to run the
+    full ESFS workflow — including ES-GSS, ES-CCF, and ES-FMG — directly on
+    Seurat objects, with automatic GPU acceleration via CUDA (NVIDIA) or
+    MLX/Metal (Apple Silicon) where available.
+License: GPL-3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+SystemRequirements: Python (>= 3.10), conda or pip
+URL: https://github.com/aradley/ESFS
+BugReports: https://github.com/aradley/ESFS/issues
+Imports:
+    reticulate (>= 1.30),
+    Matrix,
+    methods,
+    png,
+    grid
+Suggests:
+    Seurat (>= 5.0.0),
+    rstudioapi,
+    remotes,
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr

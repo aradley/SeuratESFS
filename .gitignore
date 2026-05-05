@@ -1,0 +1,33 @@
+# R package build artefacts
+*.Rproj.user/
+*.Rhistory
+*.RData
+*.Ruserdata
+.Rproj.user
+.Rproj
+
+# roxygen2 / devtools
+man/*.Rd
+NAMESPACE.bak
+
+# R check output
+*.tar.gz
+*.Rcheck/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temp / OS
+Thumbs.db
+*~
+
+# Python (in case any test scripts are added)
+__pycache__/
+*.py[cod]
+.env
+
+# Rendered vignette output (keep source only)
+docs/*.html
+docs/*.md
