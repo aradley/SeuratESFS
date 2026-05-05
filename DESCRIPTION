@@ -23,13 +23,13 @@ Imports:
     Matrix,
     methods,
     png,
-    grid
+    grid,
+    zellkonverter,
+    BiocParallel
 Suggests:
     Seurat (>= 5.0.0),
     rstudioapi,
     remotes,
     knitr,
-    rmarkdown,
-    zellkonverter,
-    BiocParallel
+    rmarkdown
 VignetteBuilder: knitr
