@@ -71,10 +71,9 @@ install_esfs <- function(
     message("  Backend : ", backend)
     reticulate::py_install(
       esfs_pkg,
-      envname             = envname,
-      method              = existing_method,
-      pip                 = TRUE,
-      pip_ignore_installed = TRUE
+      envname = envname,
+      method  = existing_method,
+      pip     = TRUE
     )
     .verify_esfs_installation(envname, existing_method)
     message("\n=== Reinstall complete ===")
@@ -197,7 +196,7 @@ check_esfs <- function(envname = NULL) {
     cfg     <- reticulate::py_config()
     # cfg$version can be a list in newer reticulate — flatten safely
     ver_str <- tryCatch(
-      paste(unlist(cfg[["version"]]), collapse = ""),
+      paste(unlist(cfg[["version"]]), collapse = "."),
       error = function(e) "unknown"
     )
     cat("[OK] Python ", ver_str, "\n", sep = "")
@@ -215,7 +214,8 @@ check_esfs <- function(envname = NULL) {
     expected <- normalizePath(expected_env_path %||% "", mustWork = FALSE)
     if (!is.null(expected_env_path) &&
           !identical(active, expected)) {
-      cat("[!!] WARNING: Active Python is NOT from '", envname, "'!\n", sep = "")
+      cat("[!!] WARNING: Active Python is NOT from '", envname,
+          "'!\n", sep = "")
       cat("     Expected: ", expected_env_path, "\n", sep = "")
       cat("     Fix: add  options(esfs.conda_env = \"", envname,
           "\")  to ~/.Rprofile\n", sep = "")
