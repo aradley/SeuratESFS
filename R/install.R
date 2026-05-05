@@ -1,9 +1,17 @@
 #' Install the ESFS Python environment
 #'
 #' Creates a dedicated Python environment and installs the ESFS package along
-#' with all required dependencies. This function needs to be called only once
-#' per machine. After installation, add the following line to your
-#' `~/.Rprofile` so the environment is found automatically in every session:
+#' with all required dependencies. Safe to call repeatedly:
+#'
+#' - **First run**: creates the `r-esfs` conda environment and installs all
+#'   dependencies (~5 minutes).
+#' - **Subsequent runs** (e.g. after updating SeuratESFS via
+#'   `remotes::install_github("aradley/SeuratESFS")`): detects the existing
+#'   environment and only force-reinstalls the ESFS Python package from GitHub
+#'   (~30 seconds), leaving all other dependencies untouched.
+#'
+#' After the first installation, add the following line to your `~/.Rprofile`
+#' so the environment is found automatically in every session:
 #'
 #' ```r
 #' options(esfs.conda_env = "r-esfs")
@@ -48,6 +56,42 @@ install_esfs <- function(
 
   if (backend == "auto") backend <- .detect_esfs_backend()
 
+  extras   <- switch(backend, cpu = "", mlx = "[mlx]", gpu = "[gpu]")
+  esfs_pkg <- paste0(
+    "esfs", extras,
+    " @ git+https://github.com/aradley/ESFS.git@memory_optimised"
+  )
+
+  # ---- Fast path: environment already exists --------------------------------
+  # Just force-reinstall ESFS from GitHub; skip recreating the env and
+  # reinstalling all core deps (saves ~5 minutes on subsequent calls).
+  conda_exists <- reticulate::condaenv_exists(envname)
+  venv_exists  <- reticulate::virtualenv_exists(envname)
+
+  if (conda_exists || venv_exists) {
+    existing_method <- if (conda_exists) "conda" else "virtualenv"
+    message("Environment '", envname, "' already exists.")
+    message("Reinstalling ESFS from GitHub (memory_optimised branch)...")
+    message("  Backend : ", backend)
+    reticulate::py_install(
+      esfs_pkg,
+      envname             = envname,
+      method              = existing_method,
+      pip                 = TRUE,
+      pip_ignore_installed = TRUE
+    )
+    .verify_esfs_installation(envname, existing_method)
+    message("\n=== Reinstall complete ===")
+    message("Restart R to pick up the updated ESFS package.")
+    if (restart_session &&
+        requireNamespace("rstudioapi", quietly = TRUE) &&
+        rstudioapi::isAvailable()) {
+      rstudioapi::restartSession()
+    }
+    return(invisible(envname))
+  }
+
+  # ---- Full path: create environment from scratch --------------------------
   message("Installing ESFS Python environment")
   message("  Environment : ", envname)
   message("  Backend     : ", backend)
@@ -63,7 +107,6 @@ install_esfs <- function(
     }
   }
 
-  # Create the isolated environment
   if (method == "conda") {
     reticulate::conda_create(envname        = envname,
                              python_version = python_version)
@@ -72,7 +115,6 @@ install_esfs <- function(
                                   python  = python_version)
   }
 
-  # Core Python packages (always required)
   core_pkgs <- c(
     "numpy", "scipy<2.0", "pandas", "matplotlib", "plotly",
     "anndata>=0.10,<0.12", "scanpy[leiden]>=1.10,<2.0",
@@ -85,18 +127,10 @@ install_esfs <- function(
   reticulate::py_install(core_pkgs, envname = envname,
                          method = method, pip = TRUE)
 
-  # ESFS package from GitHub with optional extras
-  extras   <- switch(backend, cpu = "", mlx = "[mlx]", gpu = "[gpu]")
-  esfs_pkg <- paste0(
-    "esfs", extras,
-    " @ git+https://github.com/aradley/ESFS.git@memory_optimised"
-  )
-
-  message("\nInstalling ESFS", extras, " from GitHub...")
+  message("\nInstalling ESFS", extras, " from GitHub (memory_optimised branch)...")
   reticulate::py_install(esfs_pkg, envname = envname,
                          method = method, pip = TRUE)
 
-  # Verify everything works
   .verify_esfs_installation(envname, method)
 
   message("\n=== Installation complete ===")
