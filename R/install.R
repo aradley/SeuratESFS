@@ -111,13 +111,35 @@ install_esfs <- function(
                                   python  = python_version)
   }
 
+  # numba/llvmlite must be installed via conda, not pip.
+  # pip-installed llvmlite links against libc++.1.dylib via @rpath, which
+  # macOS cannot resolve when Python is loaded through R/reticulate because
+  # R.framework ends up in the rpath and libc++.1.dylib is not there.
+  # conda install pulls libcxx as a proper conda dep, placing
+  # libc++.1.dylib in the env's lib/ where the linker finds it.
+  if (method == "conda") {
+    message(
+      "\nInstalling numba via conda (required for macOS + R compatibility)..."
+    )
+    reticulate::conda_install(
+      envname  = envname,
+      packages = "numba>=0.60,<0.62",
+      channel  = "conda-forge",
+      pip      = FALSE
+    )
+  }
+
+  # Everything else can be pip-installed (numba excluded for conda path)
   core_pkgs <- c(
     "numpy", "scipy<2.0", "pandas", "matplotlib", "plotly",
     "anndata>=0.10,<0.12", "scanpy[leiden]>=1.10,<2.0",
     "scikit-learn>=1.4,<2.0", "umap-learn>=0.5,<0.6",
-    "numba>=0.60,<0.62", "multiprocess>=0.70,<0.80",
+    "multiprocess>=0.70,<0.80",
     "p-tqdm>=1.4,<2.0", "tqdm", "zarr>=2.16,<3.0"
   )
+  if (method != "conda") {
+    core_pkgs <- c(core_pkgs, "numba>=0.60,<0.62")
+  }
 
   message("\nInstalling core dependencies...")
   reticulate::py_install(core_pkgs, envname = envname,
@@ -316,13 +338,11 @@ check_esfs <- function(envname = NULL) {
 .verify_esfs_installation <- function(envname, method = "conda") {
   message("\nVerifying installation...")
 
-  # If Python is already running we cannot switch environments — skip the env
-  # switch and advise the user to verify in a fresh session instead.
+  # If Python is already running we cannot switch environments.
   if (reticulate::py_available(initialize = FALSE)) {
     message(
       "Note: Python is already initialised in this session; skipping\n",
-      "  environment switch. The new '", envname, "' environment will be\n",
-      "  active after you restart R. Run check_esfs() to confirm."
+      "  environment switch. Run check_esfs() in a fresh R session to confirm."
     )
     return(invisible(NULL))
   }
@@ -337,12 +357,24 @@ check_esfs <- function(envname = NULL) {
     esfs <- reticulate::import("esfs")
     ver  <- reticulate::py_to_r(esfs$`__version__`)
     message("[OK] esfs ", ver, " imported successfully")
-    esfs$configure(gpu = TRUE, upcast = FALSE, verbose = FALSE)
-    message("[OK] Backend: ", reticulate::py_to_r(esfs$get_backend_info()))
   }, error = function(e) {
-    stop(
-      "Installation verification failed: ", conditionMessage(e), "\n",
-      "Run check_esfs() for a full diagnostic report."
-    )
+    msg <- conditionMessage(e)
+    message("[!!] esfs import failed: ", msg)
+    if (grepl("shared object|dylib|OSError|LoadLibrary", msg,
+              ignore.case = TRUE)) {
+      message(
+        "     Likely cause: the GPU/Metal backend library failed to load.\n",
+        "     Fix options:\n",
+        "       1. CPU-only (recommended): delete the env and reinstall:\n",
+        "            conda env remove -n ", envname,
+        "  # run in terminal\n",
+        "          then: install_esfs(backend = \"cpu\")\n",
+        "       2. Diagnose: run  reticulate::py_last_error()  for details."
+      )
+    } else {
+      message(
+        "     Run check_esfs() or reticulate::py_last_error() for details."
+      )
+    }
   })
 }
