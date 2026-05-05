@@ -10,12 +10,8 @@
 #'   environment and only force-reinstalls the ESFS Python package from GitHub
 #'   (~30 seconds), leaving all other dependencies untouched.
 #'
-#' After the first installation, add the following line to your `~/.Rprofile`
-#' so the environment is found automatically in every session:
-#'
-#' ```r
-#' options(esfs.conda_env = "r-esfs")
-#' ```
+#' The `~/.Rprofile` option `esfs.conda_env` is written automatically so the
+#' correct Python environment is found in every future R session.
 #'
 #' @param envname Name of the conda or virtualenv environment to create.
 #'   Defaults to `"r-esfs"`.
@@ -82,10 +78,11 @@ install_esfs <- function(
     )
     .verify_esfs_installation(envname, existing_method)
     message("\n=== Reinstall complete ===")
+    .add_rprofile_option(envname)
     message("Restart R to pick up the updated ESFS package.")
     if (restart_session &&
-        requireNamespace("rstudioapi", quietly = TRUE) &&
-        rstudioapi::isAvailable()) {
+          requireNamespace("rstudioapi", quietly = TRUE) &&
+          rstudioapi::isAvailable()) {
       rstudioapi::restartSession()
     }
     return(invisible(envname))
@@ -127,20 +124,22 @@ install_esfs <- function(
   reticulate::py_install(core_pkgs, envname = envname,
                          method = method, pip = TRUE)
 
-  message("\nInstalling ESFS", extras, " from GitHub (memory_optimised branch)...")
+  message(
+    "\nInstalling ESFS", extras,
+    " from GitHub (memory_optimised branch)..."
+  )
   reticulate::py_install(esfs_pkg, envname = envname,
                          method = method, pip = TRUE)
 
   .verify_esfs_installation(envname, method)
 
   message("\n=== Installation complete ===")
-  message("Add the following line to your ~/.Rprofile for automatic setup:")
-  message('  options(esfs.conda_env = "', envname, '")')
-  message("Then restart R.")
+  .add_rprofile_option(envname)
+  message("Restart R.")
 
   if (restart_session &&
-      requireNamespace("rstudioapi", quietly = TRUE) &&
-      rstudioapi::isAvailable()) {
+        requireNamespace("rstudioapi", quietly = TRUE) &&
+        rstudioapi::isAvailable()) {
     rstudioapi::restartSession()
   }
 
@@ -172,10 +171,13 @@ check_esfs <- function(envname = NULL) {
   cat("=== SeuratESFS Diagnostic Report ===\n\n")
 
   # R package versions
-  cat("[R] SeuratESFS :", tryCatch(
-        as.character(utils::packageVersion("SeuratESFS")), error = function(e) "?"),
-      "\n")
-  cat("[R] reticulate :", as.character(utils::packageVersion("reticulate")), "\n\n")
+  seurat_esfs_ver <- tryCatch(
+    as.character(utils::packageVersion("SeuratESFS")),
+    error = function(e) "?"
+  )
+  cat("[R] SeuratESFS :", seurat_esfs_ver, "\n")
+  cat("[R] reticulate :",
+      as.character(utils::packageVersion("reticulate")), "\n\n")
 
   # Environment existence
   conda_ok <- reticulate::condaenv_exists(envname)
@@ -209,9 +211,10 @@ check_esfs <- function(envname = NULL) {
         file.path(reticulate::virtualenv_root(), envname, "bin", "python")
     }, error = function(e) NULL)
 
+    active   <- normalizePath(cfg$python, mustWork = FALSE)
+    expected <- normalizePath(expected_env_path %||% "", mustWork = FALSE)
     if (!is.null(expected_env_path) &&
-        !identical(normalizePath(cfg$python, mustWork = FALSE),
-                   normalizePath(expected_env_path, mustWork = FALSE))) {
+          !identical(active, expected)) {
       cat("[!!] WARNING: Active Python is NOT from '", envname, "'!\n", sep = "")
       cat("     Expected: ", expected_env_path, "\n", sep = "")
       cat("     Fix: add  options(esfs.conda_env = \"", envname,
@@ -258,6 +261,32 @@ check_esfs <- function(envname = NULL) {
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+#' @keywords internal
+.add_rprofile_option <- function(envname) {
+  rprofile    <- path.expand("~/.Rprofile")
+  option_line <- paste0('options(esfs.conda_env = "', envname, '")')
+
+  existing <- if (file.exists(rprofile)) {
+    readLines(rprofile, warn = FALSE)
+  } else {
+    character(0)
+  }
+
+  if (any(grepl("esfs.conda_env", existing, fixed = TRUE))) {
+    message(
+      "  ~/.Rprofile already contains esfs.conda_env — no change needed."
+    )
+    return(invisible(NULL))
+  }
+
+  # Append with a preceding blank line for readability
+  write(c("", option_line), file = rprofile, append = TRUE)
+  message("  Added to ~/.Rprofile: ", option_line)
+  message(
+    "  This ensures the correct Python environment is used in every session."
+  )
+}
 
 #' @keywords internal
 .detect_esfs_backend <- function() {
