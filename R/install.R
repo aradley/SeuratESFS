@@ -89,7 +89,7 @@ install_esfs <- function(
   extras   <- switch(backend, cpu = "", mlx = "[mlx]", gpu = "[gpu]")
   esfs_pkg <- paste0(
     "esfs", extras,
-    " @ git+https://github.com/aradley/ESFS.git"
+    " @ git+https://github.com/aradley/ESFS.git@memory_optimised"
   )
 
   message("\nInstalling ESFS", extras, " from GitHub...")
@@ -227,6 +227,17 @@ check_esfs <- function(envname = NULL) {
 #' @keywords internal
 .verify_esfs_installation <- function(envname, method = "conda") {
   message("\nVerifying installation...")
+
+  # If Python is already running we cannot switch environments — skip the env
+  # switch and advise the user to verify in a fresh session instead.
+  if (reticulate::py_available(initialize = FALSE)) {
+    message(
+      "Note: Python is already initialised in this session; skipping\n",
+      "  environment switch. The new '", envname, "' environment will be\n",
+      "  active after you restart R. Run check_esfs() to confirm."
+    )
+    return(invisible(NULL))
+  }
 
   if (method == "conda") {
     reticulate::use_condaenv(envname, required = TRUE)
