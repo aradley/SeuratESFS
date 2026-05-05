@@ -32,4 +32,7 @@ Suggests:
     remotes,
     knitr,
     rmarkdown
+Remotes:
+    bioc::BiocParallel,
+    bioc::zellkonverter
 VignetteBuilder: knitr
