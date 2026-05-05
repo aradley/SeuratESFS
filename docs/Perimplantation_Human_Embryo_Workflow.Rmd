@@ -76,8 +76,12 @@ GetESFSBackendInfo()
 ## Load data
 
 ```{r load-data}
+# zellkonverter uses BiocParallel internally — run serially so reticulate/Python
+# executes in the main process where the r-esfs env is already initialised.
+BiocParallel::register(BiocParallel::SerialParam())
+
 # Read h5ad into a SingleCellExperiment and convert to Seurat
-sce <- zellkonverter::readH5AD(file.path(path, "ES_adata.h5ad"))
+sce <- zellkonverter::readH5AD(file.path(path, "ES_adata.h5ad"), reader = "python")
 obj <- SeuratObject::as.Seurat(sce, counts = "X", data = NULL)
 DefaultAssay(obj) <- "RNA"
 
@@ -562,7 +566,7 @@ model_genes <- reticulate::py_to_r(bundle$gene_list)
 
 ```{r load-west2019}
 # Load West2019 query data
-west_sce <- zellkonverter::readH5AD(file.path(path, "West2019.h5ad"))
+west_sce <- zellkonverter::readH5AD(file.path(path, "West2019.h5ad"), reader = "python")
 west_obj <- SeuratObject::as.Seurat(west_sce, counts = "X", data = NULL)
 
 # Ensure unique cell names
