@@ -41,6 +41,20 @@ CreateESFSScaledMatrix <- function(
   )
 
   object <- .store_esfs_from_adata(object, adata)
+
+  # Subset Seurat object to genes retained after low-expression filtering
+  retained <- Seurat::Misc(object, slot = "esfs_retained_genes")
+  if (!is.null(retained)) {
+    n_removed <- nrow(object) - length(retained)
+    if (n_removed > 0) {
+      message(sprintf(
+        "Removed %d low-expression genes (min_total_expr = %d). %d genes retained.",
+        n_removed, min_total_expr, length(retained)
+      ))
+      object <- object[retained, ]
+    }
+  }
+
   object <- Seurat::LogSeuratCommand(object)
   object
 }
@@ -57,30 +71,44 @@ CreateESFSScaledMatrix <- function(
 #' - **Apple Silicon (MLX/Metal)**: GPU-accelerated ES matrix calculations
 #' - **CPU**: Numba JIT-compiled parallel computation
 #'
-#' @param object          A Seurat object that has been processed with
+#' @param object                  A Seurat object that has been processed with
 #'   [CreateESFSScaledMatrix()].
-#' @param assay           Assay to use.
-#' @param label           Label for the secondary features (default `"Self"`
-#'   compares each gene to every other gene).
-#' @param save_matrices   Which ES matrices to save in the Seurat object.
-#'   Default `c("ESSs", "EPs")`; can also include `"SWs"` and `"SGs"`.
-#' @param n_cores         Number of CPU cores for the CPU path (`-1L` = all
-#'   available). Ignored when GPU is active.
-#' @param conda_env       Conda/virtualenv environment name.
+#' @param assay                   Assay to use.
+#' @param label                   Label for the secondary features (default
+#'   `"Self"` compares each gene to every other gene). For custom secondary
+#'   features (e.g. batch labels, Leiden clusters), supply the matrix via
+#'   `secondary_features_matrix`.
+#' @param save_matrices           Which ES matrices to save in the Seurat
+#'   object. Default `c("ESSs", "EPs")`; can also include `"SWs"` and `"SGs"`.
+#' @param n_cores                 Number of CPU cores for the CPU path (`-1L`
+#'   = all available). Ignored when GPU is active.
+#' @param secondary_features_matrix An optional cells × features matrix
+#'   (`dgCMatrix` or dense `matrix`) to use as secondary features instead of
+#'   the gene set. Rows must match cells in `object`. Required for batch-effect
+#'   gene detection and the ES-CCF workflow. Cached in `misc` so [RunESCCF()]
+#'   and [RunESFMG()] can restore it automatically.
+#' @param conda_env               Conda/virtualenv environment name.
 #'
 #' @return The Seurat object with ES matrices stored in `misc`.
 #' @export
-#' @seealso [CreateESFSScaledMatrix()], [ESRankGenes()]
+#' @seealso [CreateESFSScaledMatrix()], [ESRankGenes()], [RunESCCF()]
 CalcESMatrices <- function(
   object,
-  assay         = Seurat::DefaultAssay(object),
-  label         = "Self",
-  save_matrices = c("ESSs", "EPs"),
-  n_cores       = -1L,
-  conda_env     = NULL
+  assay                     = Seurat::DefaultAssay(object),
+  label                     = "Self",
+  save_matrices             = c("ESSs", "EPs"),
+  n_cores                   = -1L,
+  secondary_features_matrix = NULL,
+  conda_env                 = NULL
 ) {
   esfs  <- .get_esfs(conda_env)
   adata <- .build_and_restore_adata(object, assay = assay, label = label)
+
+  # Assign custom secondary features to obsm (overrides any auto-restored matrix)
+  if (!is.null(secondary_features_matrix)) {
+    scipy <- reticulate::import("scipy", convert = FALSE)
+    adata$obsm[label] <- scipy$sparse$csc_matrix(secondary_features_matrix)
+  }
 
   adata <- esfs$parallel_calc_es_matrices(
     adata,
@@ -90,6 +118,13 @@ CalcESMatrices <- function(
   )
 
   object <- .store_esfs_from_adata(object, adata, label = label)
+
+  # Cache secondary features matrix so RunESCCF / RunESFMG can restore it
+  if (!is.null(secondary_features_matrix)) {
+    cache_slot <- paste0("esfs_secondary_features_matrix_", label)
+    Seurat::Misc(object, slot = cache_slot) <- secondary_features_matrix
+  }
+
   object <- Seurat::LogSeuratCommand(object)
   object
 }
@@ -102,13 +137,19 @@ CalcESMatrices <- function(
 #' Find optimal cluster combinations per gene (ES-CCF)
 #'
 #' Wraps `esfs.ES_CCF()`. For each gene, identifies the combination of
-#' clusters that maximises ES correlation. Requires an over-clustered
-#' one-hot-encoded cluster matrix as secondary features in `adata.obsm`.
+#' clusters that maximises ES correlation. The `secondary_features_matrix`
+#' passed to the preceding [CalcESMatrices()] call is restored automatically
+#' from `misc` — no need to pass it again here.
 #'
-#' @param object    A Seurat object with ES matrices computed.
+#' After running, the Max_ESS_Features matrix is cached in `misc` and
+#' automatically restored by the subsequent [CalcESMatrices()] and
+#' [RunESFMG()] calls, so no manual plumbing is required.
+#'
+#' @param object    A Seurat object with ES matrices computed via
+#'   [CalcESMatrices()] using the same `label`.
 #' @param assay     Assay to use.
-#' @param label     Secondary features label matching the clustering stored in
-#'   the Seurat object.
+#' @param label     Secondary features label matching the preceding
+#'   [CalcESMatrices()] call.
 #' @param n_cores   Number of CPU cores (`-1L` = all).
 #' @param conda_env Conda/virtualenv environment name.
 #'
@@ -132,6 +173,26 @@ RunESCCF <- function(
   )
 
   object <- .store_esfs_from_adata(object, adata, label = label)
+
+  # Extract Max_ESS_Features obsm matrix and cache it so the subsequent
+  # CalcESMatrices / RunESFMG calls can restore it automatically
+  max_ess_key <- paste0(label, "_Max_ESS_Features")
+  has_max_ess <- reticulate::py_to_r(reticulate::py_eval(
+    sprintf("'%s' in adata.obsm", max_ess_key),
+    local = list(adata = adata)
+  ))
+  if (isTRUE(has_max_ess)) {
+    scipy       <- reticulate::import("scipy", convert = FALSE)
+    max_ess_py  <- adata$obsm[max_ess_key]
+    max_ess_r   <- reticulate::py_to_r(max_ess_py)
+    cache_slot  <- paste0("esfs_secondary_features_matrix_", max_ess_key)
+    Seurat::Misc(object, slot = cache_slot) <- max_ess_r
+    message(
+      "Max_ESS_Features cached in misc ('", cache_slot, "').\n",
+      "Pass label = \"", max_ess_key, "\" to CalcESMatrices() and RunESFMG()."
+    )
+  }
+
   object <- Seurat::LogSeuratCommand(object)
   object
 }

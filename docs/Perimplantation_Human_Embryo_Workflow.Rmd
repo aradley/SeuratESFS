@@ -1,0 +1,652 @@
+---
+title: "ESFS Workflow — Peri-implantation Human Embryo Example"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  eval      = FALSE
+)
+```
+
+> **Reference:** Radley A. *et al.* (2026) *Entropy Sorting Feature Selection for single-cell RNA sequencing.*
+> Preprint: <https://www.biorxiv.org/content/10.64898/2026.01.26.701684v1>
+> Data: <https://figshare.com/s/4e445e7fa03cc4ccd289>
+
+---
+
+## Overview
+
+This notebook is an R equivalent of the Python Jupyter workflow for the peri-implantation human embryo
+scRNA-seq dataset (7,732 cells × 16,633 genes, multiple labs/datasets integrated).
+
+The workflow demonstrates:
+
+1. Identifying a compact set of biologically informative genes (ES-GSS)
+2. Removing dataset-specific batch-effect genes without smoothing or integration
+3. Generating high-resolution cell UMAPs that reveal developmental trajectories
+4. Finding optimal marker genes (ES-CCF + ES-FMG)
+5. Projecting query data onto the reference embedding
+
+**Important:** Load `SeuratESFS` *before* Seurat and any other package that may
+initialise Python.
+
+---
+
+## Setup
+
+### Data path — edit this
+
+```{r data-path}
+path <- "/Users/radleya/The Francis Crick Dropbox/BriscoeJ/Radleya/ESFS_Paper/Paper_Submission/Data/Peri_implantation_Human_Embryo_Example/"
+```
+
+### Load packages
+
+```{r load-packages}
+# SeuratESFS MUST be loaded before Seurat to configure the Python environment first
+library(SeuratESFS)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+
+# For reading h5ad files into Seurat — install if needed:
+# BiocManager::install("zellkonverter")
+library(zellkonverter)
+```
+
+### Check ESFS backend
+
+```{r check-backend}
+check_esfs()
+GetESFSBackendInfo()
+```
+
+---
+
+## Load data
+
+```{r load-data}
+# Read h5ad into a SingleCellExperiment and convert to Seurat
+sce <- zellkonverter::readH5AD(file.path(path, "ES_adata.h5ad"))
+obj <- SeuratObject::as.Seurat(sce, counts = "X", data = NULL)
+DefaultAssay(obj) <- "RNA"
+
+# Verify key metadata columns
+message("Cells: ", ncol(obj), "   Genes: ", nrow(obj))
+message("Metadata columns: ", paste(colnames(obj[[]]), collapse = ", "))
+head(obj[[c("Original_Annotation", "Timepoint", "Dataset")]])
+```
+
+---
+
+## Step 1 — Scale the count matrix
+
+`CreateESFSScaledMatrix()` clips each gene at the 97.5th percentile and normalises to [0, 1].
+Genes with very low total expression are removed (default `min_total_expr = 50`).
+
+```{r scale-matrix}
+obj <- CreateESFSScaledMatrix(obj)
+message("Genes after filtering: ", nrow(obj))
+```
+
+---
+
+## Step 2 — Calculate pairwise ES matrices (Self)
+
+This is the main computational step. For the human embryo dataset
+(~15,000 genes after filtering), expect ~15–25 minutes on a modern CPU.
+Apple Silicon (MLX/Metal) or NVIDIA (CUDA) GPUs will be used automatically if available.
+
+*Note: on first run, Numba will JIT-compile the CPU kernels — this causes a
+one-time delay of ~30 seconds before progress appears.*
+
+```{r calc-es-self}
+obj <- CalcESMatrices(
+  obj,
+  label         = "Self",
+  save_matrices = c("ESSs", "EPs"),
+  n_cores       = -1L
+)
+```
+
+---
+
+## Step 3 — Identify and exclude batch-effect genes
+
+The dataset combines cells from multiple labs. Rather than batch integration,
+ESFS identifies genes whose expression is strongly associated with the *Dataset*
+label and excludes them before gene ranking.
+
+### Build the one-hot Dataset matrix
+
+```{r batch-onehot}
+dataset_labels  <- obj$Dataset
+unique_datasets <- sort(unique(dataset_labels))
+message("Datasets: ", paste(unique_datasets, collapse = ", "))
+
+dataset_onehot <- Matrix::sparseMatrix(
+  i    = seq_along(dataset_labels),
+  j    = match(dataset_labels, unique_datasets),
+  x    = 1,
+  dims = c(length(dataset_labels), length(unique_datasets)),
+  dimnames = list(colnames(obj), unique_datasets)
+)
+```
+
+### Calculate ES metrics against Dataset labels
+
+```{r calc-es-batch}
+obj <- CalcESMatrices(
+  obj,
+  label                     = "Dataset_Secondary_Features",
+  save_matrices             = c("ESSs", "EPs", "SGs"),
+  secondary_features_matrix = dataset_onehot
+)
+```
+
+### Identify batch-effect genes
+
+```{r find-batch-genes}
+batch_ess <- Seurat::Misc(obj, "esfs_Dataset_Secondary_Features_ESSs")
+# batch_ess: matrix of n_genes × n_datasets — genes with any ESS > 0.01 are batch-associated
+batch_gene_mask <- apply(batch_ess > 0.01, 1, any)
+batch_genes     <- rownames(obj)[batch_gene_mask]
+message(sprintf("Identified %d potential batch-effect genes", length(batch_genes)))
+```
+
+---
+
+## Step 4 — Rank genes by ES network connectivity
+
+`ESRankGenes()` builds a weighted gene network from the Self ES matrices and ranks genes
+by normalised connectivity. Batch-effect genes are excluded from the network.
+
+Because the batch-effect step (Step 3) and the Self step (Step 2) use *different*
+label keys, the Self ES matrices are preserved in `misc` and restored automatically here.
+
+```{r rank-genes}
+known_genes <- c("NANOG", "SOX17", "GATA4", "PDGFRA", "PRSS3", "SPIC")
+
+obj <- ESRankGenes(
+  obj,
+  label         = "Self",
+  ep_threshold  = 0.0,
+  ess_threshold = 0.01,
+  exclude_genes = batch_genes,
+  known_genes   = known_genes,
+  min_edges     = 5L
+)
+```
+
+---
+
+## Step 5 — Visualise top-ranked genes in a gene-space UMAP
+
+Genes are embedded in 2-D based on their pairwise ESS scores.
+HDBSCAN groups genes into clusters that share similar expression patterns.
+
+Adjust `top_ranked_genes` (3,000–5,000 is typical) and `clustering` to optimise
+the gene UMAP for your data.
+
+```{r gene-umap}
+gene_umap <- PlotESFSGeneUMAP(
+  obj,
+  top_ranked_genes  = 4000L,
+  label             = "Self",
+  clustering        = "hdbscan",
+  known_genes       = known_genes,
+  umap_min_dist     = 0.1,
+  umap_neighbours   = 20L,
+  hdbscan_min_size  = 50L,
+  dpi               = 150L
+)
+
+# The returned list gives access to the gene cluster data:
+top_ess_genes    <- gene_umap$genes   # character vector of gene names
+gene_clust_labels <- gene_umap$labels  # integer cluster label per gene
+message(sprintf("Gene clusters: %s", paste(sort(unique(gene_clust_labels)), collapse = ", ")))
+```
+
+---
+
+## Step 6 — Compute cell UMAPs for each gene cluster
+
+For each gene cluster, project all cells into a 2-D UMAP using that cluster's gene
+set as features.
+
+**Backend note:** UMAP computation is GPU-accelerated on NVIDIA (cuML) only.
+On Apple Silicon and CPU, umap-learn is used (still fast for ~8,000 cells).
+
+```{r cell-umaps-all}
+cell_umaps <- GetESFSCellUMAPs(
+  obj,
+  gene_clust_labels = gene_clust_labels,
+  top_ess_genes     = top_ess_genes,
+  n_neighbors       = 50L,
+  min_dist          = 0.1,
+  log_transformed   = TRUE,
+  return_model      = FALSE
+)
+```
+
+### Plot by cell annotation
+
+```{r plot-cell-umaps-annotation}
+PlotESFSCellUMAPs(
+  obj,
+  gene_cluster_embeddings      = cell_umaps[[1]],
+  gene_cluster_selected_genes  = cell_umaps[[2]],
+  cell_label           = "Original_Annotation",
+  ncol                 = 3L,
+  figsize              = c(16, 5),
+  marker_size          = 1L,
+  log2_gene_expression = TRUE,
+  dpi                  = 150L
+)
+```
+
+### Plot by gene expression (NANOG)
+
+```{r plot-cell-umaps-nanog}
+PlotESFSCellUMAPs(
+  obj,
+  gene_cluster_embeddings      = cell_umaps[[1]],
+  gene_cluster_selected_genes  = cell_umaps[[2]],
+  cell_label           = "NANOG",
+  ncol                 = 3L,
+  figsize              = c(16, 5),
+  marker_size          = 1L,
+  log2_gene_expression = TRUE,
+  dpi                  = 150L
+)
+```
+
+---
+
+## Step 7 — Focus on the most informative gene cluster
+
+Inspect the gene UMAPs from Step 6 and identify the cluster that best resolves
+the biological structure of interest. For the human embryo data, cluster 1
+captures the most distinct developmental trajectories.
+
+```{r cell-umaps-cluster1}
+cell_umaps_c1 <- GetESFSCellUMAPs(
+  obj,
+  gene_clust_labels = gene_clust_labels,
+  top_ess_genes     = top_ess_genes,
+  specific_cluster  = c(1L),    # use c() to ensure R vector -> Python list
+  n_neighbors       = 50L,
+  min_dist          = 0.1,
+  log_transformed   = TRUE,
+  return_model      = FALSE
+)
+
+# Extract the gene set that produced this embedding
+es_gss_genes <- reticulate::py_to_r(cell_umaps_c1[[2]][[1]])
+message(sprintf("ES-GSS gene set: %d genes", length(es_gss_genes)))
+```
+
+```{r plot-cluster1-multi}
+# By cell annotation
+PlotESFSCellUMAPs(
+  obj,
+  gene_cluster_embeddings     = cell_umaps_c1[[1]],
+  gene_cluster_selected_genes = cell_umaps_c1[[2]],
+  cell_label = "Original_Annotation",
+  ncol = 1L, figsize = c(5, 5), marker_size = 1L
+)
+
+# By timepoint
+PlotESFSCellUMAPs(
+  obj,
+  gene_cluster_embeddings     = cell_umaps_c1[[1]],
+  gene_cluster_selected_genes = cell_umaps_c1[[2]],
+  cell_label = "Timepoint",
+  ncol = 1L, figsize = c(5, 5), marker_size = 1L
+)
+
+# By dataset (check batch-effect removal worked)
+PlotESFSCellUMAPs(
+  obj,
+  gene_cluster_embeddings     = cell_umaps_c1[[1]],
+  gene_cluster_selected_genes = cell_umaps_c1[[2]],
+  cell_label = "Dataset",
+  ncol = 1L, figsize = c(5, 5), marker_size = 1L
+)
+```
+
+---
+
+## Step 8 — KNN expression smoothing
+
+Smooth gene expression by averaging each cell over its 50 nearest neighbours in
+correlation-distance space defined by the ES-GSS gene set.
+
+**Backend note:** KNN computation is GPU-accelerated on NVIDIA (cuML). On Apple
+Silicon and CPU, chunked BLAS matrix multiplication is used (O(N²) — slower for
+large datasets). The smoothed matrix is transferred to Seurat only if ≤ `max_size_gb`.
+
+```{r knn-smooth}
+obj <- KNNSmoothESFS(
+  obj,
+  use_genes   = es_gss_genes,
+  knn         = 50L,
+  log_scale   = FALSE,
+  max_size_gb = 2.0
+)
+
+# If the smoothed expression was extracted (small enough dataset), use it with Seurat:
+# FeaturePlot(obj, features = "NANOG", layer = "esfs.smoothed")
+```
+
+---
+
+## Step 9 — ES-CCF: Combinatorial Cluster Finder
+
+ES-CCF identifies the combination of clusters that maximally correlates with each
+gene's expression. This requires intentional over-clustering followed by computing
+ES metrics against those cluster labels.
+
+### Step 9a — Leiden over-clustering
+
+Use scanpy (already in the `r-esfs` Python environment) for KNN + Leiden with the
+exact settings from the Python workflow (correlation distance, n_neighbors = 50,
+resolution = 8).
+
+```{r leiden-clustering}
+sc <- reticulate::import("scanpy", convert = FALSE)
+np <- reticulate::import("numpy", convert = FALSE)
+ad <- reticulate::import("anndata", convert = FALSE)
+
+# Build a temporary AnnData with just the ES-GSS genes, log2 transformed
+log2_counts <- log2(as.matrix(Seurat::LayerData(obj[es_gss_genes, ], layer = "counts")) + 1)
+
+sub_adata <- ad$AnnData(X = np$array(t(log2_counts), dtype = "float32"))
+
+sc$pp$neighbors(sub_adata, n_neighbors = 50L, n_pcs = 0L, metric = "correlation")
+sc$tl$leiden(sub_adata, resolution = 8.0)
+
+leiden_labels <- reticulate::py_to_r(sub_adata$obs["leiden"])$leiden
+obj$leiden_clusters <- leiden_labels
+n_clusters <- length(unique(leiden_labels))
+message(sprintf("Leiden produced %d clusters", n_clusters))
+```
+
+> **Note:** `sc$tl$leiden()` requires the `leidenalg` Python package. If you get
+> an error, install it: in your `r-esfs` conda environment run
+> `pip install leidenalg`. Alternatively replace with `sc$tl$louvain()`.
+
+### Step 9b — Calculate ES matrices for Leiden secondary features
+
+```{r calc-es-leiden}
+# One-hot encoding of Leiden cluster labels (cells × n_clusters)
+unique_leiden <- sort(unique(leiden_labels))
+
+leiden_onehot <- Matrix::sparseMatrix(
+  i    = seq_along(leiden_labels),
+  j    = match(leiden_labels, unique_leiden),
+  x    = 1,
+  dims = c(length(leiden_labels), length(unique_leiden)),
+  dimnames = list(colnames(obj), unique_leiden)
+)
+
+obj <- CalcESMatrices(
+  obj,
+  label                     = "Leiden_Clusts_Secondary_Features",
+  save_matrices             = c("ESSs", "SGs"),
+  secondary_features_matrix = leiden_onehot
+)
+```
+
+### Step 9c — Run ES-CCF
+
+For each gene, ES-CCF identifies which combination of Leiden clusters maximally
+correlates with that gene's expression. The output (`Max_ESS_Features`) is
+automatically cached in `misc` for the next step.
+
+```{r run-esccf}
+obj <- RunESCCF(
+  obj,
+  label   = "Leiden_Clusts_Secondary_Features",
+  n_cores = -1L
+)
+# The message above shows the cache key to use in the next CalcESMatrices call
+```
+
+### Step 9d — Calculate ES matrices for Max_ESS_Features
+
+The Max_ESS_Features matrix (cached by RunESCCF) is used as secondary features
+to compute gene–cluster ESS scores. The matrix is restored automatically from `misc`.
+
+```{r calc-es-max-ess}
+obj <- CalcESMatrices(
+  obj,
+  label         = "Leiden_Clusts_Secondary_Features_Max_ESS_Features",
+  save_matrices = c("ESSs")
+)
+```
+
+### Step 9e — Run ES-FMG to select marker genes
+
+ES-FMG uses simulated annealing to find a compact set of N genes that captures the
+most non-redundant expression patterns across all identified cluster structures.
+
+```{r run-esfmg}
+fmg_result <- RunESFMG(
+  obj,
+  N           = 300L,
+  label       = "Leiden_Clusts_Secondary_Features_Max_ESS_Features",
+  num_reheats = 3L,
+  resolution  = 1.0
+)
+
+chosen_genes <- fmg_result$genes
+chosen_scores <- fmg_result$scores
+obj <- fmg_result$object
+
+message(sprintf("ES-FMG selected %d marker genes", length(chosen_genes)))
+head(data.frame(gene = chosen_genes, score = chosen_scores))
+```
+
+### Step 9f — Visualise marker gene expression
+
+```{r plot-markers}
+# Choose a few genes to inspect — use chosen_genes for the full set
+plot_genes <- c("PRSS3", "PDGFRA", "ATP6V0D2")
+
+# Get the ES-GSS UMAP embedding as an R matrix for custom plotting
+cell_umaps_embed <- GetESFSCellUMAPs(
+  obj,
+  gene_clust_labels = gene_clust_labels,
+  top_ess_genes     = top_ess_genes,
+  specific_cluster  = c(1L),
+  n_neighbors       = 50L,
+  min_dist          = 0.1,
+  log_transformed   = TRUE,
+  return_model      = FALSE
+)
+es_umap_embedding <- reticulate::py_to_r(cell_umaps_embed[[1]][[1]])  # cells × 2
+
+for (gene in plot_genes) {
+  raw_expr <- as.numeric(Seurat::LayerData(obj, layer = "counts")[gene, ])
+  raw_expr <- pmin(raw_expr, quantile(raw_expr, 0.975))
+
+  df_plot <- data.frame(
+    UMAP1 = es_umap_embedding[, 1],
+    UMAP2 = es_umap_embedding[, 2],
+    Raw   = raw_expr
+  )
+
+  p_raw <- ggplot(df_plot, aes(UMAP1, UMAP2, color = Raw)) +
+    geom_point(size = 0.5) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                          midpoint = median(raw_expr)) +
+    theme_void() + labs(title = paste(gene, "— raw expression"), color = "Expr")
+
+  print(p_raw)
+
+  # If smoothed expression was extracted to Seurat, plot that too:
+  if ("esfs.smoothed" %in% Seurat::Layers(obj)) {
+    smooth_expr <- as.numeric(Seurat::LayerData(obj, layer = "esfs.smoothed")[gene, ])
+    smooth_expr <- pmin(smooth_expr, quantile(smooth_expr, 0.975))
+    df_plot$Smooth <- smooth_expr
+
+    p_smooth <- ggplot(df_plot, aes(UMAP1, UMAP2, color = Smooth)) +
+      geom_point(size = 0.5) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                            midpoint = median(smooth_expr)) +
+      theme_void() + labs(title = paste(gene, "— kNN smoothed"), color = "Expr")
+
+    print(p_smooth)
+  }
+}
+```
+
+---
+
+## Step 10 — Save the UMAP model
+
+Save the fitted UMAP model so new cells can be projected without re-running the
+full workflow.
+
+```{r save-umap-model}
+# Re-run GetESFSCellUMAPs with return_model = TRUE to get the saveable model
+cell_umaps_model <- GetESFSCellUMAPs(
+  obj,
+  gene_clust_labels = gene_clust_labels,
+  top_ess_genes     = top_ess_genes,
+  specific_cluster  = c(1L),
+  n_neighbors       = 50L,
+  min_dist          = 0.1,
+  log_transformed   = TRUE,
+  return_model      = TRUE
+)
+
+umap_model     <- cell_umaps_model[[1]][[1]]   # fitted umap-learn model
+umap_gene_list <- reticulate::py_to_r(cell_umaps_model[[2]][[1]])  # gene names
+
+# Retrieve the embedding coordinates from the fitted model
+es_umap_embedding <- reticulate::py_to_r(umap_model$embedding_)   # cells × 2
+
+SaveESFSUMAPModel(
+  model           = umap_model,
+  gene_list       = umap_gene_list,
+  filepath        = file.path(path, "cluster1_umap.joblib"),
+  log_transformed = TRUE
+)
+message("UMAP model saved to: ", file.path(path, "cluster1_umap.joblib"))
+```
+
+---
+
+## Step 11 — Project query data onto the reference UMAP
+
+Load the West et al. 2019 CTB/STB/EVT dataset and project it onto the early embryo
+embedding using the saved UMAP model.
+
+```{r load-umap-model}
+bundle      <- LoadESFSUMAPModel(file.path(path, "cluster1_umap.joblib"))
+model       <- bundle$model        # Python umap-learn model (supports .transform())
+model_genes <- reticulate::py_to_r(bundle$gene_list)
+```
+
+```{r load-west2019}
+# Load West2019 query data
+west_sce <- zellkonverter::readH5AD(file.path(path, "West2019.h5ad"))
+west_obj <- SeuratObject::as.Seurat(west_sce, counts = "X", data = NULL)
+
+# Ensure unique cell names
+colnames(west_obj) <- make.unique(colnames(west_obj))
+
+message("West2019: ", ncol(west_obj), " cells × ", nrow(west_obj), " genes")
+```
+
+```{r project-west2019}
+# Find gene overlap between reference gene set and query dataset
+available_genes <- intersect(model_genes, rownames(west_obj))
+missing_genes   <- setdiff(model_genes, rownames(west_obj))
+message(sprintf("Available: %d genes | Missing (set to 0): %d genes",
+                length(available_genes), length(missing_genes)))
+
+# Build cells × genes expression matrix for the query dataset
+west_counts <- t(Seurat::LayerData(west_obj, layer = "counts"))  # cells × genes
+
+avail_mat <- west_counts[, available_genes, drop = FALSE]
+if (length(missing_genes) > 0) {
+  zero_mat  <- Matrix::Matrix(0,
+    nrow = nrow(avail_mat), ncol = length(missing_genes),
+    dimnames = list(rownames(avail_mat), missing_genes),
+    sparse = TRUE)
+  full_mat <- cbind(avail_mat, zero_mat)
+} else {
+  full_mat <- avail_mat
+}
+full_mat <- full_mat[, model_genes, drop = FALSE]  # reorder to match model gene order
+
+# Log2(x+1) transform and project via the saved UMAP model
+np        <- reticulate::import("numpy", convert = FALSE)
+log2_mat  <- log2(as.matrix(full_mat) + 1)
+west2019_overlay <- reticulate::py_to_r(
+  model$transform(np$array(log2_mat, dtype = "float64"))
+)
+```
+
+```{r plot-projection-timepoint}
+df_ref  <- data.frame(UMAP1 = es_umap_embedding[, 1],
+                      UMAP2 = es_umap_embedding[, 2])
+df_west <- data.frame(UMAP1      = west2019_overlay[, 1],
+                      UMAP2      = west2019_overlay[, 2],
+                      Timepoint  = west_obj$Timepoints,
+                      CellType   = west_obj$West_Labels)
+
+ggplot() +
+  geom_point(data = df_ref,  aes(UMAP1, UMAP2),
+             color = "gainsboro", size = 0.5) +
+  geom_point(data = df_west, aes(UMAP1, UMAP2, color = Timepoint),
+             size = 1.5, alpha = 0.9) +
+  theme_void() +
+  labs(title = "West2019 — projected by timepoint", color = "Timepoint")
+```
+
+```{r plot-projection-celltype}
+ggplot() +
+  geom_point(data = df_ref,  aes(UMAP1, UMAP2),
+             color = "gainsboro", size = 0.5) +
+  geom_point(data = df_west, aes(UMAP1, UMAP2, color = CellType),
+             size = 1.5, alpha = 0.9) +
+  theme_void() +
+  labs(title = "West2019 — projected by cell type", color = "Cell type")
+```
+
+---
+
+## Save results
+
+```{r save-results, eval=FALSE}
+# Save the Seurat object with all ESFS results stored in misc
+saveRDS(obj, file.path(path, "ES_seurat_obj.rds"))
+
+# Save intermediate vectors for reproducibility
+saveRDS(es_gss_genes,     file.path(path, "ES_GSS_Genes.rds"))
+saveRDS(leiden_labels,    file.path(path, "Leiden_Clusts.rds"))
+saveRDS(chosen_genes,     file.path(path, "ES_FMG_Marker_Genes.rds"))
+saveRDS(es_umap_embedding, file.path(path, "ES_UMAP_Embedding.rds"))
+```
+
+---
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

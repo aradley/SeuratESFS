@@ -135,7 +135,8 @@
 #' @return The AnnData object (for chaining).
 #' @keywords internal
 .restore_esfs_to_adata <- function(adata, object, label = "Self") {
-  np <- reticulate::import("numpy", convert = FALSE)
+  np    <- reticulate::import("numpy", convert = FALSE)
+  scipy <- reticulate::import("scipy",  convert = FALSE)
 
   # Scaled counts layer
   scaled <- Seurat::Misc(object, slot = "esfs_Scaled_Counts")
@@ -146,10 +147,10 @@
     )
   }
 
-  # Gene-level ES matrices stored in varm (genes × genes square)
+  # Gene-level ES matrices — label-specific misc keys prevent cross-label overwrites
   for (key in c("ESSs", "EPs", "SWs", "SGs")) {
-    slot_name <- paste0("esfs_", key)
-    mat       <- Seurat::Misc(object, slot = slot_name)
+    misc_slot <- paste0("esfs_", label, "_", key)
+    mat       <- Seurat::Misc(object, slot = misc_slot)
     if (!is.null(mat)) {
       adata$varm[paste0(label, "_", key)] <- np$array(mat, dtype = "float32")
     }
@@ -170,9 +171,21 @@
   # KNN distance graph (sparse cells × cells)
   knn_graph <- object[["esfs.knn"]]
   if (!is.null(knn_graph)) {
-    scipy <- reticulate::import("scipy", convert = FALSE)
     knn_r <- as(knn_graph, "CsparseMatrix")
     adata$obsp["correlation_distance_kNN"] <- scipy$sparse$csr_matrix(knn_r)
+  }
+
+  # Restore cached secondary-feature obsm matrices (set by CalcESMatrices and
+  # RunESCCF so subsequent functions — RunESCCF, RunESFMG — find them in obsm)
+  all_misc  <- Seurat::Misc(object)
+  sf_prefix <- "esfs_secondary_features_matrix_"
+  sf_slots  <- names(all_misc)[startsWith(names(all_misc), sf_prefix)]
+  for (sf_slot in sf_slots) {
+    obsm_label <- sub(sf_prefix, "", sf_slot, fixed = TRUE)
+    sf_mat     <- all_misc[[sf_slot]]
+    if (!is.null(sf_mat)) {
+      adata$obsm[obsm_label] <- scipy$sparse$csc_matrix(sf_mat)
+    }
   }
 
   adata
@@ -199,18 +212,24 @@
     Seurat::Misc(object, slot = "esfs_Scaled_Counts") <- Matrix::t(
       Matrix::Matrix(scaled_r, sparse = FALSE)
     )
+    # Retain gene names after potential filtering by create_scaled_matrix()
+    var_names <- reticulate::py_to_r(reticulate::py_eval(
+      "list(adata.var_names)", convert = TRUE, local = list(adata = adata)
+    ))
+    Seurat::Misc(object, slot = "esfs_retained_genes") <- var_names
   }
 
-  # Gene-level ES matrices (varm stores genes × n)
+  # Gene-level ES matrices — label-specific keys prevent cross-label overwrites
   varm_keys <- reticulate::py_to_r(reticulate::py_eval(
     "list(adata.varm.keys())", convert = TRUE,
     local = list(adata = adata)
   ))
   for (key in c("ESSs", "EPs", "SWs", "SGs")) {
-    varm_key <- paste0(label, "_", key)
+    varm_key  <- paste0(label, "_", key)
+    misc_slot <- paste0("esfs_", label, "_", key)
     if (varm_key %in% varm_keys) {
       mat <- reticulate::py_to_r(adata$varm[varm_key])
-      Seurat::Misc(object, slot = paste0("esfs_", key)) <- mat
+      Seurat::Misc(object, slot = misc_slot) <- mat
     }
   }
 
