@@ -192,9 +192,34 @@ check_esfs <- function(envname = NULL) {
 
   # Python interpreter
   if (reticulate::py_available()) {
-    cfg <- reticulate::py_config()
-    cat("[OK] Python ", cfg$version, "\n", sep = "")
-    cat("     Path: ", cfg$python, "\n\n", sep = "")
+    cfg     <- reticulate::py_config()
+    # cfg$version can be a list in newer reticulate — flatten safely
+    ver_str <- tryCatch(
+      paste(unlist(cfg[["version"]]), collapse = ""),
+      error = function(e) "unknown"
+    )
+    cat("[OK] Python ", ver_str, "\n", sep = "")
+    cat("     Path   : ", cfg$python, "\n", sep = "")
+
+    # Warn if the active Python is not inside the expected environment
+    expected_env_path <- tryCatch({
+      if (reticulate::condaenv_exists(envname))
+        reticulate::conda_python(envname = envname)
+      else
+        file.path(reticulate::virtualenv_root(), envname, "bin", "python")
+    }, error = function(e) NULL)
+
+    if (!is.null(expected_env_path) &&
+        !identical(normalizePath(cfg$python, mustWork = FALSE),
+                   normalizePath(expected_env_path, mustWork = FALSE))) {
+      cat("[!!] WARNING: Active Python is NOT from '", envname, "'!\n", sep = "")
+      cat("     Expected: ", expected_env_path, "\n", sep = "")
+      cat("     Fix: add  options(esfs.conda_env = \"", envname,
+          "\")  to ~/.Rprofile\n", sep = "")
+      cat("          then restart R and load SeuratESFS BEFORE any other\n")
+      cat("          package that uses Python.\n")
+    }
+    cat("\n")
   } else {
     cat("[!!] Python not initialised\n\n")
     return(invisible(NULL))
